@@ -5,6 +5,7 @@
 #include "gtest/gtest.h"
 #endif
 #include <cstddef>
+#include <algorithm>
 #include <map>
 #include <unordered_set>
 
@@ -22,6 +23,9 @@ namespace infini {
 
     // pointer to the memory actually allocated
     void *ptr;
+
+    // Free blocks indexed by their starting offsets.
+    std::map<size_t, size_t> freeBlocks;
 
     // =================================== 作业 ===================================
     // TODO：可能需要设计一个数据结构来存储free block，以便于管理和合并
