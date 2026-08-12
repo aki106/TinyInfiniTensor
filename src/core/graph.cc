@@ -1,7 +1,10 @@
 #include "core/graph.h"
+#include "operators/matmul.h"
+#include "operators/transpose.h"
 #include <algorithm>
 #include <numeric>
 #include <queue>
+#include <unordered_map>
 
 namespace infini
 {
@@ -100,6 +103,135 @@ namespace infini
 
     void GraphObj::optimize()
     {
+        auto rebuildConnections = [this]()
+        {
+            for (const auto &tensor : tensors)
+            {
+                tensor->targets.clear();
+                tensor->source.reset();
+            }
+            for (const auto &op : ops)
+            {
+                op->predecessors.clear();
+                op->successors.clear();
+            }
+            for (const auto &op : ops)
+            {
+                for (const auto &input : op->inputs)
+                    input->addTarget(op);
+                for (const auto &output : op->outputs)
+                    output->setSource(op);
+            }
+            for (const auto &op : ops)
+                for (const auto &input : op->inputs)
+                    if (auto pred = input->getSource())
+                    {
+                        pred->addSuccessors(op);
+                        op->addPredecessors(pred);
+                    }
+        };
+
+        // Remove pairs of transposes whose permutations compose to identity.
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+            for (const auto &firstOp : ops)
+            {
+                auto first = as<TransposeObj>(firstOp);
+                if (!first)
+                    continue;
+                auto middle = first->getOutput();
+                auto targets = middle->getTargets();
+                if (targets.size() != 1)
+                    continue;
+                auto second = as<TransposeObj>(targets[0]);
+                if (!second)
+                    continue;
+
+                const auto p = first->getPermute();
+                const auto q = second->getPermute();
+                bool inverse = p.size() == q.size();
+                for (size_t i = 0; inverse && i < p.size(); ++i)
+                    inverse = q[i] >= 0 && q[i] < static_cast<int>(p.size()) &&
+                              p[q[i]] == static_cast<int>(i);
+                if (!inverse)
+                    continue;
+
+                auto original = first->getInputs(0);
+                auto redundant = second->getOutput();
+                auto consumers = redundant->getTargets();
+                if (consumers.empty())
+                    continue;
+                for (const auto &consumer : consumers)
+                    consumer->replaceInput(redundant, original);
+
+                ops.erase(std::remove(ops.begin(), ops.end(), firstOp), ops.end());
+                ops.erase(std::remove(ops.begin(), ops.end(), targets[0]), ops.end());
+                tensors.erase(std::remove(tensors.begin(), tensors.end(), middle),
+                              tensors.end());
+                tensors.erase(std::remove(tensors.begin(), tensors.end(), redundant),
+                              tensors.end());
+                rebuildConnections();
+                changed = true;
+                break;
+            }
+        }
+
+        // Fold a last-two-axis transpose into the corresponding Matmul flag.
+        changed = true;
+        while (changed)
+        {
+            changed = false;
+            for (const auto &op : ops)
+            {
+                auto matmul = as<MatmulObj>(op);
+                if (!matmul)
+                    continue;
+                for (size_t inputIndex = 0; inputIndex < 2; ++inputIndex)
+                {
+                    auto transposed = matmul->getInputs(inputIndex);
+                    auto transpose = as<TransposeObj>(transposed->getSource());
+                    if (!transpose || transposed->getTargets().size() != 1)
+                        continue;
+                    const auto perm = transpose->getPermute();
+                    bool swapsLastTwo = perm.size() >= 2;
+                    for (size_t i = 0; swapsLastTwo && i + 2 < perm.size(); ++i)
+                        swapsLastTwo = perm[i] == static_cast<int>(i);
+                    if (swapsLastTwo)
+                    {
+                        const auto rank = perm.size();
+                        swapsLastTwo = perm[rank - 2] == static_cast<int>(rank - 1) &&
+                                       perm[rank - 1] == static_cast<int>(rank - 2);
+                    }
+                    if (!swapsLastTwo)
+                        continue;
+
+                    matmul->replaceInput(transposed, transpose->getInputs(0));
+                    if (inputIndex == 0)
+                        matmul->setTransA(!matmul->getTransA());
+                    else
+                        matmul->setTransB(!matmul->getTransB());
+                    auto inferred = matmul->inferShape(matmul->getInputs());
+                    IT_ASSERT(inferred.has_value() && inferred->size() == 1 &&
+                              inferred->at(0) == matmul->getOutput()->getDims());
+
+                    auto transposeOp = transposed->getSource();
+                    ops.erase(std::remove(ops.begin(), ops.end(), transposeOp),
+                              ops.end());
+                    tensors.erase(std::remove(tensors.begin(), tensors.end(), transposed),
+                                  tensors.end());
+                    rebuildConnections();
+                    changed = true;
+                    break;
+                }
+                if (changed)
+                    break;
+            }
+        }
+
+        sorted = false;
+        IT_ASSERT(topo_sort());
         // =================================== 作业 ===================================
         // TODO: 设计一个算法来实现指定的图优化规则
         // 图优化规则如下：
@@ -147,6 +279,37 @@ namespace infini
     {
         // topological sorting first
         IT_ASSERT(topo_sort() == true);
+
+        std::unordered_map<TensorObj *, size_t> offsets;
+        std::unordered_map<TensorObj *, size_t> remainingUses;
+        for (const auto &tensor : tensors)
+            remainingUses[tensor.get()] = tensor->getTargets().size();
+
+        // Inputs are populated before execution, so they must all be live from
+        // the start even if their first consumers occur later in the graph.
+        for (const auto &input : getInputs())
+            offsets[input.get()] = allocator.alloc(input->getBytes());
+
+        for (const auto &op : ops)
+        {
+            for (const auto &output : op->getOutputs())
+                if (offsets.find(output.get()) == offsets.end())
+                    offsets[output.get()] = allocator.alloc(output->getBytes());
+
+            for (const auto &input : op->getInputs())
+            {
+                auto &uses = remainingUses[input.get()];
+                IT_ASSERT(uses > 0);
+                --uses;
+                if (uses == 0)
+                    allocator.free(offsets.at(input.get()), input->getBytes());
+            }
+        }
+
+        auto *base = static_cast<std::byte *>(allocator.getPtr());
+        for (const auto &tensor : tensors)
+            tensor->setDataBlob(
+                make_ref<BlobObj>(runtime, base + offsets.at(tensor.get())));
 
         // =================================== 作业 ===================================
         // TODO：利用 allocator 给计算图分配内存
